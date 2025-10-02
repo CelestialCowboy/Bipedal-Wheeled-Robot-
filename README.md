@@ -1,6 +1,12 @@
 A custom bipedal wheeled robot. Runs in CPP based on the simpleFOC library.
 
 **Critical Hardware:**  
+<table>
+  <tr>
+    <td>
+
+<!-- Markdown table goes here -->
+  
 | Item                          | Quantity |
 |-------------------------------|----------|
 | ESP32-Wroom                   | 1        |
@@ -20,7 +26,6 @@ A custom bipedal wheeled robot. Runs in CPP based on the simpleFOC library.
   </td>
   </tr>
 </table>
-
 
 
 
