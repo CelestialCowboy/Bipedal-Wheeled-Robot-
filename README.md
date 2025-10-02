@@ -1,4 +1,5 @@
 A custom bipedal wheeled robot. Runs in CPP based on the simpleFOC library.
+<img width="2000" height="1462" alt="161364b7-40fb-42d3-a31b-c13d1e914859" src="https://github.com/user-attachments/assets/43d6b483-948f-4fd7-9a3d-390124a25b07" />
 **Critical Hardware:**
 
 | Item                          | Quantity |
@@ -14,4 +15,4 @@ A custom bipedal wheeled robot. Runs in CPP based on the simpleFOC library.
 | 18V 2Ah Dewalt Battery        | 1        |
 | Dewalt Battery Adapter        | 1        |
 
-<img width="2000" height="1462" alt="161364b7-40fb-42d3-a31b-c13d1e914859" src="https://github.com/user-attachments/assets/43d6b483-948f-4fd7-9a3d-390124a25b07" />
+
