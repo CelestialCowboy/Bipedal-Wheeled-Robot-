@@ -270,7 +270,7 @@ void loop() {
     lastCommand = millis();
   }
 
-  // Less frequent debug output
+  // Reduced debug output
   static unsigned long lastPrint = 0;
   if (millis() - lastPrint > 500) {
     Serial.print("Pitch: ");
@@ -280,6 +280,4 @@ void loop() {
     Serial.println("V");
     lastPrint = millis();
   }
-
-  // No artificial delay - run as fast as possible for maximum responsiveness
 }
