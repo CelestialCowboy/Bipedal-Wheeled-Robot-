@@ -96,10 +96,23 @@ Adafruit_MPU6050 mpu;
 #define PCA9548A_ADDR 0x70
 
 // ====== PID Controller for Balancing ======
-// Reduced D term since Kalman filter handles noise
-PIDController pid_balance = PIDController(0.6, 0.33 , 0.01, 10000, 20);
+PIDController pid_balance = PIDController(0.62, 0.35, 0.01, 10000, 20);
 const float TARGET_PITCH = -3.0;
 const float DEAD_ZONE = 0.05;
+
+// ====== Motor Balance Compensation ======
+float motor_balance_compensation = 0.0; // Voltage adjustment to balance motors
+const float BALANCE_KP = 0.25;  // Proportional gain for velocity matching
+const float BALANCE_KI = 0.02;  // Integral gain for persistent imbalance
+float velocity_error_integral = 0.0;
+const float MAX_BALANCE_COMPENSATION = 4.0; // Maximum compensation voltage
+
+// Velocity tracking
+float motor1_velocity = 0.0;
+float motor2_velocity = 0.0;
+float last_motor1_angle = 0.0;
+float last_motor2_angle = 0.0;
+unsigned long last_velocity_time = 0;
 
 // ====== Motor, Driver, Sensor ======
 BLDCMotor motor1 = BLDCMotor(7, 0.1, 400);
@@ -124,22 +137,37 @@ void selectI2CChannel(uint8_t channel) {
   Wire.write(1 << channel);
   if (Wire.endTransmission() != 0) {
     Serial.println("Failed to select I2C channel!");
-    // Handle error (e.g., retry or halt)
   }
 }
 
-void setup() {
-  pinMode(OC_ADJ1, OUTPUT);  // For Motor 1
-  digitalWrite(OC_ADJ1, HIGH);  // Set to DVDD for max threshold (~0.2V V_DS)
+// ====== FALL DETECTION & RECOVERY STATE MACHINE ======
+enum RobotState {
+  NORMAL,
+  FALLEN,
+  RECOVERY
+};
 
-  pinMode(OC_ADJ2, OUTPUT);  // For Motor 2
+RobotState robotState = NORMAL;
+
+const float FALL_THRESHOLD = 65.0;     // degrees
+const float UPRIGHT_MIN = -10.0;       // degrees
+const float UPRIGHT_MAX = 10.0;        // degrees
+const unsigned long RECOVERY_TIME = 5000; // 5 seconds in ms
+
+unsigned long uprightStartTime = 0;
+
+void setup() {
+  pinMode(OC_ADJ1, OUTPUT);
+  digitalWrite(OC_ADJ1, HIGH);
+
+  pinMode(OC_ADJ2, OUTPUT);
   digitalWrite(OC_ADJ2, HIGH);
 
   Serial.begin(115200);
   Serial.println("Starting initialization...");
 
   Wire.begin();
-  Wire.setClock(400000); // Increased I2C speed to 400kHz for better performance
+  Wire.setClock(400000);
 
   // Test I2C Mux
   Wire.beginTransmission(PCA9548A_ADDR);
@@ -155,7 +183,6 @@ void setup() {
     while (1) delay(10);
   }
 
-  // Configure MPU6050 for faster response
   mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_94_HZ);
@@ -207,77 +234,205 @@ void setup() {
 
   command.add('M', doMotor, "Motor");
   Serial.println("Motors ready!");
-
+  
   // Initialize Kalman filter with first measurement
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
   float initialPitch = atan2(-a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * 180.0 / PI;
   kalmanFilter.angle = initialPitch;
+
+  // Initialize velocity tracking
+  selectI2CChannel(2);
+  last_motor1_angle = motor1.shaft_angle;
+  selectI2CChannel(3);
+  last_motor2_angle = motor2.shaft_angle;
+  last_velocity_time = micros();
+
+  // Start in NORMAL state
+  robotState = NORMAL;
+  Serial.println("Robot state: NORMAL");
+  
 }
 
 float getPitchKalman() {
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
-  // Calculate accelerometer-based pitch
   float accelPitch = atan2(-a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * 180.0 / PI;
+  float gyroRate = g.gyro.y * 180.0 / PI;
   
-  // Get gyro rate (y-axis for pitch)
-  float gyroRate = g.gyro.y * 180.0 / PI; // Convert to degrees/sec
-  
-  // Calculate time step
   static unsigned long lastTime = micros();
   unsigned long now = micros();
-  float dt = (now - lastTime) / 1000000.0f; // Convert to seconds
+  float dt = (now - lastTime) / 1000000.0f;
   lastTime = now;
   
-  // Apply Kalman filter
   float filteredPitch = kalmanFilter.getAngle(accelPitch, gyroRate, dt);
   
   return filteredPitch;
 }
 
+void updateMotorVelocities() {
+  unsigned long now = micros();
+  float dt = (now - last_velocity_time) / 1000000.0f;
+  
+  if (dt > 0.001) { // Update at least every 1ms
+    // Read motor angles
+    selectI2CChannel(2);
+    float current_motor1_angle = motor1.shaft_angle;
+    
+    selectI2CChannel(3);
+    float current_motor2_angle = motor2.shaft_angle;
+    
+    // Calculate velocities (rad/s)
+    motor1_velocity = (current_motor1_angle - last_motor1_angle) / dt;
+    motor2_velocity = (current_motor2_angle - last_motor2_angle) / dt;
+    
+    // Apply low-pass filter for smoother velocity estimation
+    static float filtered_vel1 = 0.0;
+    static float filtered_vel2 = 0.0;
+    filtered_vel1 = 0.7 * filtered_vel1 + 0.3 * motor1_velocity;
+    
+    motor1_velocity = filtered_vel1;
+    motor2_velocity = filtered_vel2;
+    
+    // Update tracking variables
+    last_motor1_angle = current_motor1_angle;
+    last_motor2_angle = current_motor2_angle;
+    last_velocity_time = now;
+  }
+}
+
+float calculateMotorBalanceCompensation() {
+  // Calculate velocity difference (motor1 should equal -motor2 for straight movement)
+  // Positive velocity_error means motor1 is spinning faster than it should relative to motor2
+  float velocity_error = motor1_velocity + motor2_velocity; // Should be ~0 for balanced movement
+  
+  // Only apply compensation when motors are actually moving
+  float avg_speed = (abs(motor1_velocity) + abs(motor2_velocity)) / 2.0;
+  
+  if (avg_speed > 0.5) { // Only compensate when moving (0.5 rad/s threshold)
+    // Proportional compensation
+    float p_compensation = BALANCE_KP * velocity_error;
+    
+    // Integral compensation for persistent imbalance
+    velocity_error_integral += velocity_error * 0.001; // Assuming ~1ms loop time
+    velocity_error_integral = constrain(velocity_error_integral, -5.0, 5.0); // Anti-windup
+    float i_compensation = BALANCE_KI * velocity_error_integral;
+    
+    motor_balance_compensation = p_compensation + i_compensation;
+    motor_balance_compensation = constrain(motor_balance_compensation, -MAX_BALANCE_COMPENSATION, MAX_BALANCE_COMPENSATION);
+  } else {
+    // Reset integral when not moving to prevent windup
+    velocity_error_integral *= 0.95; // Slow decay
+    motor_balance_compensation *= 0.9; // Gradually reduce compensation
+  }
+  
+  return motor_balance_compensation;
+}
+
+// ====== NEW: Safe Motor Control Function ======
+void safeMoveMotors(float voltage, float balance_comp) {
+  if (robotState == NORMAL) {
+    motor1.target = -voltage - balance_comp;
+    motor2.target = voltage - balance_comp;
+  } else {
+    // In FALLEN or RECOVERY: STOP MOTORS
+    motor1.target = 0;
+    motor2.target = 0;
+  }
+
+  // Always run FOC (keeps commutation active)
+  selectI2CChannel(2);
+  motor1.loopFOC();
+  motor1.move();
+  selectI2CChannel(3);
+  motor2.loopFOC();
+  motor2.move();
+}
+
+// ====== loop() ======
 void loop() {
+  // Update motor velocities from encoders
+  updateMotorVelocities();
+
   // Get filtered pitch using Kalman filter
   float pitch = getPitchKalman();
   float pitch_error = TARGET_PITCH - pitch;
 
-  // Apply dead zone
-  if (abs(pitch_error) < DEAD_ZONE) {
-    pitch_error = 0;
+  // === STATE MACHINE LOGIC ===
+  switch (robotState) {
+    case NORMAL:
+      // Check for fall
+      if (abs(pitch) > FALL_THRESHOLD) {
+        robotState = FALLEN;
+        uprightStartTime = 0;
+        Serial.println("*** ROBOT FELL! Motors stopped. Hold upright to recover... ***");
+      } else {
+        // Normal balancing control
+        if (abs(pitch_error) < DEAD_ZONE) {
+          pitch_error = 0;
+        }
+        float voltage = pid_balance(pitch_error);
+        float balance_comp = calculateMotorBalanceCompensation();
+        safeMoveMotors(voltage, balance_comp);
+      }
+      break;
+
+    case FALLEN:
+      // Motors already stopped in safeMoveMotors()
+      safeMoveMotors(0, 0);
+
+      // Check if now upright
+      if (pitch >= UPRIGHT_MIN && pitch <= UPRIGHT_MAX) {
+        if (uprightStartTime == 0) {
+          uprightStartTime = millis();
+          Serial.println("Upright detected. Starting 5-second hold timer...");
+        } else if (millis() - uprightStartTime >= RECOVERY_TIME) {
+          robotState = NORMAL;
+          velocity_error_integral = 0;  // Reset integrator on recovery
+          motor_balance_compensation = 0;
+          Serial.println("*** ROBOT RECOVERED! Resuming balance control. ***");
+        }
+      } else {
+        // Not upright — reset timer
+        uprightStartTime = 0;
+      }
+      break;
+
+    case RECOVERY:
+      // Should not reach here — merged into FALLEN logic
+      break;
   }
 
-  // Compute control voltage
-  float voltage = pid_balance(pitch_error);
-
-  // Apply voltage to motors
-  motor1.target = -voltage;
-  motor2.target = voltage;
-
-  // Motor control
-  selectI2CChannel(2);
-  motor1.loopFOC();
-  motor1.move();
-
-  selectI2CChannel(3);
-  motor2.loopFOC();
-  motor2.move();
-
-  // Reduced frequency command checking
+  // === Command handling (reduced frequency) ===
   static unsigned long lastCommand = 0;
   if (millis() - lastCommand > 100) {
     command.run();
     lastCommand = millis();
   }
 
-  // Reduced debug output
+  // === Debug output ===
   static unsigned long lastPrint = 0;
   if (millis() - lastPrint > 500) {
     Serial.print("Pitch: ");
     Serial.print(pitch, 1);
-    Serial.print("°, Voltage: ");
-    Serial.print(voltage, 2);
-    Serial.println("V");
+    Serial.print("° | State: ");
+    switch(robotState) {
+      case NORMAL:   Serial.print("NORMAL"); break;
+      case FALLEN:   Serial.print("FALLEN"); break;
+      case RECOVERY: Serial.print("RECOVERY"); break;
+    }
+    if (robotState == FALLEN && uprightStartTime > 0) {
+      unsigned long elapsed = millis() - uprightStartTime;
+      Serial.print(" | Hold: ");
+      Serial.print(elapsed / 1000.0, 1);
+      Serial.print("s");
+    }
+    Serial.print(" | M1vel: ");
+    Serial.print(motor1_velocity, 2);
+    Serial.print(" | M2vel: ");
+    Serial.print(motor2_velocity, 2);
+    Serial.println();
     lastPrint = millis();
   }
 }
