@@ -1,437 +1,356 @@
+/*********************************************************************
+ *  Self-Balancing Robot – SimpleFOC + MPU6050 + AS5600 (via I2C mux)
+ *  ---------------------------------------------------------------
+ *  • Kalman-filtered pitch
+ *  • PID balance control
+ *  • Motor-velocity balance compensation
+ *  • Fall-detection + 5 s upright-hold recovery
+ *********************************************************************/
+
 #include <SimpleFOC.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
 
-// ====== Simple Kalman Filter for IMU ======
+/* -------------------- 1. CONSTANTS & TUNING -------------------- */
+constexpr uint8_t PCA9548A_ADDR = 0x70;
+
+constexpr float TARGET_PITCH      = -3.0f;   // Desired pitch (deg)
+constexpr float DEAD_ZONE         = 0.05f;  // Pitch error dead-zone
+constexpr float FALL_THRESHOLD    = 65.0f;  // deg → FALLEN
+constexpr float UPRIGHT_MIN       = -10.0f;
+constexpr float UPRIGHT_MAX       =  10.0f;
+constexpr unsigned long RECOVERY_TIME = 5000; // ms
+
+// PID for balancing
+PIDController pid_balance{0.62f, 0.35f, 0.01f, 10000.0f, 20.0f};
+
+// Motor-balance compensation
+constexpr float BALANCE_KP               = 0.25f;
+constexpr float BALANCE_KI               = 0.02f;
+constexpr float MAX_BALANCE_COMPENSATION = 4.0f;
+
+/* -------------------- 2. SIMPLE KALMAN FILTER ------------------- */
 struct SimpleKalman {
-  float Q_angle;    // Process noise variance for angle
-  float Q_bias;     // Process noise variance for bias
-  float R_measure;  // Measurement noise variance
-  
-  float angle;      // The angle calculated by the Kalman filter
-  float bias;       // The gyro bias calculated by the Kalman filter
-  float rate;       // Unbiased rate calculated from the rate and the calculated bias
-  
-  float P[2][2];    // Error covariance matrix
-  
-  SimpleKalman() {
-    // Tuned for fast response with noise rejection
-    Q_angle = 0.001f;   // Process noise - smaller = trust model more
-    Q_bias = 0.003f;    // Bias process noise
-    R_measure = 0.03f;  // Measurement noise - smaller = trust measurements more
-    
-    angle = 0.0f;
-    bias = 0.0f;
-    
-    // Initialize covariance matrix
-    P[0][0] = 0.0f;
-    P[0][1] = 0.0f;
-    P[1][0] = 0.0f;
-    P[1][1] = 0.0f;
-  }
-  
+  float Q_angle   = 0.001f;
+  float Q_bias    = 0.003f;
+  float R_measure = 0.03f;
+
+  float angle = 0.0f;
+  float bias  = 0.0f;
+  float P[2][2]{};
+
   float getAngle(float newAngle, float newRate, float dt) {
-    // Prediction step
-    rate = newRate - bias;
+    // ---- prediction ----
+    const float rate = newRate - bias;
     angle += dt * rate;
-    
-    // Update error covariance matrix
+
     P[0][0] += dt * (dt * P[1][1] - P[0][1] - P[1][0] + Q_angle);
     P[0][1] -= dt * P[1][1];
     P[1][0] -= dt * P[1][1];
     P[1][1] += Q_bias * dt;
-    
-    // Innovation
-    float y = newAngle - angle;
-    
-    // Innovation covariance
-    float S = P[0][0] + R_measure;
-    
-    // Kalman gain
-    float K[2];
-    K[0] = P[0][0] / S;
-    K[1] = P[1][0] / S;
-    
-    // Update angle and bias
-    angle += K[0] * y;
-    bias += K[1] * y;
-    
-    // Update error covariance matrix
-    float P00_temp = P[0][0];
-    float P01_temp = P[0][1];
-    
-    P[0][0] -= K[0] * P00_temp;
-    P[0][1] -= K[0] * P01_temp;
-    P[1][0] -= K[1] * P00_temp;
-    P[1][1] -= K[1] * P01_temp;
-    
+
+    // ---- update ----
+    const float y = newAngle - angle;          // innovation
+    const float S = P[0][0] + R_measure;       // innovation covariance
+
+    const float K0 = P[0][0] / S;               // Kalman gains
+    const float K1 = P[1][0] / S;
+
+    angle += K0 * y;
+    bias  += K1 * y;
+
+    const float P00_temp = P[0][0];
+    const float P01_temp = P[0][1];
+
+    P[0][0] -= K0 * P00_temp;
+    P[0][1] -= K0 * P01_temp;
+    P[1][0] -= K1 * P00_temp;
+    P[1][1] -= K1 * P01_temp;
+
     return angle;
   }
 };
+SimpleKalman kalman;
 
-SimpleKalman kalmanFilter;
+/* -------------------- 3. HARDWARE PINS -------------------------- */
+struct DriverPins {
+  uint8_t inhA, inhB, inhC, enGate, pwm, oc, ocAdj;
+};
 
-// ====== IMU ======
+constexpr DriverPins drv1{16, 17, 12, 27, 26, 36, 25};
+constexpr DriverPins drv2{32, 33, 19, 13, 18, 34, 23};
+
+/* -------------------- 4. GLOBAL OBJECTS ------------------------- */
 Adafruit_MPU6050 mpu;
 
-// ====== Driver 1 Pin definitions ======
-#define INH_A1 16
-#define INH_B1 17
-#define INH_C1 12
-#define EN_GATE1 27
-#define M_PWM1 26
-#define M_OC1 36
-#define OC_ADJ1 25
+BLDCMotor   motor1{7, 0.1f, 400};
+BLDCDriver3PWM driver1{drv1.inhA, drv1.inhB, drv1.inhC, drv1.enGate};
 
-// ====== Driver 2 Pin definitions ======
-#define INH_A2 32
-#define INH_B2 33
-#define INH_C2 19
-#define EN_GATE2 13
-#define M_PWM2 18
-#define M_OC2 34
-#define OC_ADJ2 23
+BLDCMotor   motor2{7, 0.1f, 400};
+BLDCDriver3PWM driver2{drv2.inhA, drv2.inhB, drv2.inhC, drv2.enGate};
 
-#define PCA9548A_ADDR 0x70
+MagneticSensorI2C encoder1{0x36, 12, 0x0E, 4};
+MagneticSensorI2C encoder2{0x36, 12, 0x0E, 4};
 
-// ====== PID Controller for Balancing ======
-PIDController pid_balance = PIDController(0.62, 0.35, 0.01, 10000, 20);
-const float TARGET_PITCH = -3.0;
-const float DEAD_ZONE = 0.05;
+Commander command{Serial};
 
-// ====== Motor Balance Compensation ======
-float motor_balance_compensation = 0.0; // Voltage adjustment to balance motors
-const float BALANCE_KP = 0.25;  // Proportional gain for velocity matching
-const float BALANCE_KI = 0.02;  // Integral gain for persistent imbalance
-float velocity_error_integral = 0.0;
-const float MAX_BALANCE_COMPENSATION = 4.0; // Maximum compensation voltage
+/* -------------------- 5. STATE MACHINE -------------------------- */
+enum class RobotState { NORMAL, FALLEN, RECOVERY };
+RobotState robotState = RobotState::NORMAL;
+unsigned long uprightStartTime = 0;
 
-// Velocity tracking
-float motor1_velocity = 0.0;
-float motor2_velocity = 0.0;
-float last_motor1_angle = 0.0;
-float last_motor2_angle = 0.0;
-unsigned long last_velocity_time = 0;
+/* -------------------- 6. VELOCITY TRACKING ---------------------- */
+float motor1_vel = 0.0f, motor2_vel = 0.0f;
+float last_m1_angle = 0.0f, last_m2_angle = 0.0f;
+unsigned long last_vel_time = 0;
 
-// ====== Motor, Driver, Sensor ======
-BLDCMotor motor1 = BLDCMotor(7, 0.1, 400);
-BLDCDriver3PWM driver1 = BLDCDriver3PWM(INH_A1, INH_B1, INH_C1, EN_GATE1);
+/* -------------------- 7. BALANCE COMPENSATION ------------------- */
+float balance_comp = 0.0f;
+float vel_error_integral = 0.0f;
 
-BLDCMotor motor2 = BLDCMotor(7, 0.1, 400);
-BLDCDriver3PWM driver2 = BLDCDriver3PWM(INH_A2, INH_B2, INH_C2, EN_GATE2);
-
-// ====== Encoders ======
-MagneticSensorI2C encoder1 = MagneticSensorI2C(0x36, 12, 0x0E, 4);
-MagneticSensorI2C encoder2 = MagneticSensorI2C(0x36, 12, 0x0E, 4);
-
-// ====== Commander ======
-Commander command = Commander(Serial);
-void doMotor(char* cmd) {
-  command.motor(&motor1, cmd);
-  command.motor(&motor2, cmd);
-}
-
-void selectI2CChannel(uint8_t channel) {
+/* -------------------- 8. HELPERS -------------------------------- */
+static inline void selectChannel(uint8_t ch) {
   Wire.beginTransmission(PCA9548A_ADDR);
-  Wire.write(1 << channel);
+  Wire.write(1 << ch);
   if (Wire.endTransmission() != 0) {
-    Serial.println("Failed to select I2C channel!");
+    Serial.println(F("I2C mux error!"));
   }
 }
 
-// ====== FALL DETECTION & RECOVERY STATE MACHINE ======
-enum RobotState {
-  NORMAL,
-  FALLEN,
-  RECOVERY
-};
+static inline void initMotor(BLDCMotor& m, BLDCDriver3PWM& d,
+                             MagneticSensorI2C& enc, uint8_t chan) {
+  selectChannel(chan);
+  enc.init();
+  m.linkSensor(&enc);
+  d.voltage_power_supply = 24.0f;
+  d.init();
+  m.linkDriver(&d);
 
-RobotState robotState = NORMAL;
+  m.voltage_sensor_align = 1.0f;
+  m.torque_controller    = TorqueControlType::voltage;
+  m.controller           = MotionControlType::torque;
+  m.voltage_limit        = 18.0f;
 
-const float FALL_THRESHOLD = 65.0;     // degrees
-const float UPRIGHT_MIN = -10.0;       // degrees
-const float UPRIGHT_MAX = 10.0;        // degrees
-const unsigned long RECOVERY_TIME = 5000; // 5 seconds in ms
+  m.init();
+  m.initFOC();
+  m.target = 0.0f;
+}
 
-unsigned long uprightStartTime = 0;
-
+/* -------------------- 9. SETUP ---------------------------------- */
 void setup() {
-  pinMode(OC_ADJ1, OUTPUT);
-  digitalWrite(OC_ADJ1, HIGH);
-
-  pinMode(OC_ADJ2, OUTPUT);
-  digitalWrite(OC_ADJ2, HIGH);
+  // OC-ADJ pins (high → normal operation)
+  pinMode(drv1.ocAdj, OUTPUT); digitalWrite(drv1.ocAdj, HIGH);
+  pinMode(drv2.ocAdj, OUTPUT); digitalWrite(drv2.ocAdj, HIGH);
 
   Serial.begin(115200);
-  Serial.println("Starting initialization...");
+  Serial.println(F("=== Robot init ==="));
 
   Wire.begin();
   Wire.setClock(400000);
 
-  // Test I2C Mux
+  // ---- I2C mux presence ----
   Wire.beginTransmission(PCA9548A_ADDR);
   if (Wire.endTransmission() != 0) {
-    Serial.println("I2C Mux not found!");
-    while (1) delay(1000);
+    Serial.println(F("I2C mux NOT found!"));
+    while (true) delay(1000);
   }
-  Serial.println("I2C Mux found!");
+  Serial.println(F("I2C mux OK"));
 
-  // Initialize MPU6050
+  // ---- MPU6050 ----
   if (!mpu.begin()) {
-    Serial.println("Failed to find MPU6050 chip");
-    while (1) delay(10);
+    Serial.println(F("MPU6050 NOT found!"));
+    while (true) delay(10);
   }
-
   mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_94_HZ);
 
-  // DRV8302 setup
-  pinMode(M_OC1, OUTPUT); digitalWrite(M_OC1, LOW);
-  pinMode(M_PWM1, OUTPUT); digitalWrite(M_PWM1, HIGH);
-  pinMode(M_OC2, OUTPUT); digitalWrite(M_OC2, LOW);
-  pinMode(M_PWM2, OUTPUT); digitalWrite(M_PWM2, HIGH);
+  // ---- DRV8302 bootstrap ----
+  pinMode(drv1.oc, OUTPUT); digitalWrite(drv1.oc, LOW);
+  pinMode(drv1.pwm, OUTPUT); digitalWrite(drv1.pwm, HIGH);
+  pinMode(drv2.oc, OUTPUT); digitalWrite(drv2.oc, LOW);
+  pinMode(drv2.pwm, OUTPUT); digitalWrite(drv2.pwm, HIGH);
   delay(200);
 
-  // ========== Init Motor 1 ==========
-  Serial.println("Initializing Motor 1...");
-  selectI2CChannel(2);
+  // ---- Motors ----
+  initMotor(motor1, driver1, encoder1, 2);
+  initMotor(motor2, driver2, encoder2, 3);
 
-  encoder1.init();
-  motor1.linkSensor(&encoder1);
+  command.add('M', [](char* cmd) {
+    command.motor(&motor1, cmd);
+    command.motor(&motor2, cmd);
+  }, "motor");
 
-  driver1.voltage_power_supply = 24;
-  driver1.init();
-  motor1.linkDriver(&driver1);
-  motor1.voltage_sensor_align = 1;
-  motor1.torque_controller = TorqueControlType::voltage;
-  motor1.controller = MotionControlType::torque;
-  motor1.voltage_limit = 18;
-
-  motor1.init();
-  motor1.initFOC();
-  motor1.target = 0;
-
-  // ========== Init Motor 2 ==========
-  Serial.println("Initializing Motor 2...");
-  selectI2CChannel(3);
-
-  encoder2.init();
-  motor2.linkSensor(&encoder2);
-
-  driver2.voltage_power_supply = 24;
-  driver2.init();
-  motor2.linkDriver(&driver2);
-  motor2.voltage_sensor_align = 1;
-  motor2.torque_controller = TorqueControlType::voltage;
-  motor2.controller = MotionControlType::torque;
-  motor2.voltage_limit = 18;
-
-  motor2.init();
-  motor2.initFOC();
-  motor2.target = 0;
-
-  command.add('M', doMotor, "Motor");
-  Serial.println("Motors ready!");
-  
-  // Initialize Kalman filter with first measurement
+  // ---- Initial Kalman angle ----
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
-  float initialPitch = atan2(-a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * 180.0 / PI;
-  kalmanFilter.angle = initialPitch;
+  const float initPitch = atan2f(-a.acceleration.x,
+                     sqrtf(a.acceleration.y * a.acceleration.y +
+                           a.acceleration.z * a.acceleration.z)) * RAD_TO_DEG;
+  kalman.angle = initPitch;
 
-  // Initialize velocity tracking
-  selectI2CChannel(2);
-  last_motor1_angle = motor1.shaft_angle;
-  selectI2CChannel(3);
-  last_motor2_angle = motor2.shaft_angle;
-  last_velocity_time = micros();
+  // ---- Velocity tracking init ----
+  selectChannel(2); last_m1_angle = motor1.shaft_angle;
+  selectChannel(3); last_m2_angle = motor2.shaft_angle;
+  last_vel_time = micros();
 
-  // Start in NORMAL state
-  robotState = NORMAL;
-  Serial.println("Robot state: NORMAL");
-  
+  Serial.println(F("Robot ready – NORMAL"));
 }
 
-float getPitchKalman() {
+/* -------------------- 10. PITCH (KALMAN) ----------------------- */
+float getPitch() {
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
-  float accelPitch = atan2(-a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * 180.0 / PI;
-  float gyroRate = g.gyro.y * 180.0 / PI;
-  
-  static unsigned long lastTime = micros();
-  unsigned long now = micros();
-  float dt = (now - lastTime) / 1000000.0f;
-  lastTime = now;
-  
-  float filteredPitch = kalmanFilter.getAngle(accelPitch, gyroRate, dt);
-  
-  return filteredPitch;
+  const float accelPitch = atan2f(-a.acceleration.x,
+                     sqrtf(a.acceleration.y * a.acceleration.y +
+                           a.acceleration.z * a.acceleration.z)) * RAD_TO_DEG;
+  const float gyroRate   = g.gyro.y * RAD_TO_DEG;
+
+  static unsigned long last = micros();
+  const unsigned long now  = micros();
+  const float dt = (now - last) * 1e-6f;
+  last = now;
+
+  return kalman.getAngle(accelPitch, gyroRate, dt);
 }
 
-void updateMotorVelocities() {
-  unsigned long now = micros();
-  float dt = (now - last_velocity_time) / 1000000.0f;
-  
-  if (dt > 0.001) { // Update at least every 1ms
-    // Read motor angles
-    selectI2CChannel(2);
-    float current_motor1_angle = motor1.shaft_angle;
-    
-    selectI2CChannel(3);
-    float current_motor2_angle = motor2.shaft_angle;
-    
-    // Calculate velocities (rad/s)
-    motor1_velocity = (current_motor1_angle - last_motor1_angle) / dt;
-    motor2_velocity = (current_motor2_angle - last_motor2_angle) / dt;
-    
-    // Apply low-pass filter for smoother velocity estimation
-    static float filtered_vel1 = 0.0;
-    static float filtered_vel2 = 0.0;
-    filtered_vel1 = 0.7 * filtered_vel1 + 0.3 * motor1_velocity;
-    
-    motor1_velocity = filtered_vel1;
-    motor2_velocity = filtered_vel2;
-    
-    // Update tracking variables
-    last_motor1_angle = current_motor1_angle;
-    last_motor2_angle = current_motor2_angle;
-    last_velocity_time = now;
-  }
+/* -------------------- 11. VELOCITY UPDATE ---------------------- */
+void updateVelocities() {
+  const unsigned long now = micros();
+  const float dt = (now - last_vel_time) * 1e-6f;
+
+  if (dt < 0.001f) return;               // at least 1 ms
+
+  selectChannel(2);
+  const float m1_angle = motor1.shaft_angle;
+  selectChannel(3);
+  const float m2_angle = motor2.shaft_angle;
+
+  const float raw1 = (m1_angle - last_m1_angle) / dt;
+  const float raw2 = (m2_angle - last_m2_angle) / dt;
+
+  // simple 1st-order LPF
+  static float v1_filt = 0.0f, v2_filt = 0.0f;
+  v1_filt = 0.7f * v1_filt + 0.3f * raw1;
+  v2_filt = 0.7f * v2_filt + 0.3f * raw2;
+
+  motor1_vel = v1_filt;
+  motor2_vel = v2_filt;
+
+  last_m1_angle = m1_angle;
+  last_m2_angle = m2_angle;
+  last_vel_time = now;
 }
 
-float calculateMotorBalanceCompensation() {
-  // Calculate velocity difference (motor1 should equal -motor2 for straight movement)
-  // Positive velocity_error means motor1 is spinning faster than it should relative to motor2
-  float velocity_error = motor1_velocity + motor2_velocity; // Should be ~0 for balanced movement
-  
-  // Only apply compensation when motors are actually moving
-  float avg_speed = (abs(motor1_velocity) + abs(motor2_velocity)) / 2.0;
-  
-  if (avg_speed > 0.5) { // Only compensate when moving (0.5 rad/s threshold)
-    // Proportional compensation
-    float p_compensation = BALANCE_KP * velocity_error;
-    
-    // Integral compensation for persistent imbalance
-    velocity_error_integral += velocity_error * 0.001; // Assuming ~1ms loop time
-    velocity_error_integral = constrain(velocity_error_integral, -5.0, 5.0); // Anti-windup
-    float i_compensation = BALANCE_KI * velocity_error_integral;
-    
-    motor_balance_compensation = p_compensation + i_compensation;
-    motor_balance_compensation = constrain(motor_balance_compensation, -MAX_BALANCE_COMPENSATION, MAX_BALANCE_COMPENSATION);
+/* -------------------- 12. BALANCE COMPENSATION ----------------- */
+float calcBalanceComp() {
+  // Desired: motor1_vel ≈ -motor2_vel  →  sum ≈ 0
+  const float vel_error = motor1_vel + motor2_vel;
+  const float avg_speed = (abs(motor1_vel) + abs(motor2_vel)) * 0.5f;
+
+  if (avg_speed > 0.5f) {                 // only when moving
+    const float p = BALANCE_KP * vel_error;
+
+    vel_error_integral += vel_error * 0.001f;   // ~1 ms loop
+    vel_error_integral = constrain(vel_error_integral, -5.0f, 5.0f);
+    const float i = BALANCE_KI * vel_error_integral;
+
+    balance_comp = constrain(p + i, -MAX_BALANCE_COMPENSATION,
+                                   MAX_BALANCE_COMPENSATION);
   } else {
-    // Reset integral when not moving to prevent windup
-    velocity_error_integral *= 0.95; // Slow decay
-    motor_balance_compensation *= 0.9; // Gradually reduce compensation
+    vel_error_integral *= 0.95f;          // decay
+    balance_comp       *= 0.90f;
   }
-  
-  return motor_balance_compensation;
+  return balance_comp;
 }
 
-// ====== NEW: Safe Motor Control Function ======
-void safeMoveMotors(float voltage, float balance_comp) {
-  if (robotState == NORMAL) {
-    motor1.target = -voltage - balance_comp;
-    motor2.target = voltage - balance_comp;
+/* -------------------- 13. SAFE MOTOR DRIVE --------------------- */
+void driveMotors(float voltage, float comp) {
+  if (robotState == RobotState::NORMAL) {
+    motor1.target = -voltage - comp;
+    motor2.target =  voltage - comp;
   } else {
-    // In FALLEN or RECOVERY: STOP MOTORS
-    motor1.target = 0;
-    motor2.target = 0;
+    motor1.target = motor2.target = 0.0f;
   }
 
-  // Always run FOC (keeps commutation active)
-  selectI2CChannel(2);
+  // Keep FOC alive
+  selectChannel(2);
   motor1.loopFOC();
   motor1.move();
-  selectI2CChannel(3);
+
+  selectChannel(3);
   motor2.loopFOC();
   motor2.move();
 }
 
-// ====== loop() ======
+/* -------------------- 14. MAIN LOOP ---------------------------- */
 void loop() {
-  // Update motor velocities from encoders
-  updateMotorVelocities();
+  updateVelocities();
+  const float pitch = getPitch();
+  const float pitch_err = TARGET_PITCH - pitch;
 
-  // Get filtered pitch using Kalman filter
-  float pitch = getPitchKalman();
-  float pitch_error = TARGET_PITCH - pitch;
-
-  // === STATE MACHINE LOGIC ===
+  /* ---------- STATE MACHINE ---------- */
   switch (robotState) {
-    case NORMAL:
-      // Check for fall
+    case RobotState::NORMAL:
       if (abs(pitch) > FALL_THRESHOLD) {
-        robotState = FALLEN;
+        robotState = RobotState::FALLEN;
         uprightStartTime = 0;
-        Serial.println("*** ROBOT FELL! Motors stopped. Hold upright to recover... ***");
+        Serial.println(F("*** FALL DETECTED – motors stopped ***"));
       } else {
-        // Normal balancing control
-        if (abs(pitch_error) < DEAD_ZONE) {
-          pitch_error = 0;
-        }
-        float voltage = pid_balance(pitch_error);
-        float balance_comp = calculateMotorBalanceCompensation();
-        safeMoveMotors(voltage, balance_comp);
+        const float err = (abs(pitch_err) < DEAD_ZONE) ? 0.0f : pitch_err;
+        const float voltage = pid_balance(err);
+        const float comp = calcBalanceComp();
+        driveMotors(voltage, comp);
       }
       break;
 
-    case FALLEN:
-      // Motors already stopped in safeMoveMotors()
-      safeMoveMotors(0, 0);
+    case RobotState::FALLEN:
+      driveMotors(0.0f, 0.0f);
 
-      // Check if now upright
       if (pitch >= UPRIGHT_MIN && pitch <= UPRIGHT_MAX) {
         if (uprightStartTime == 0) {
           uprightStartTime = millis();
-          Serial.println("Upright detected. Starting 5-second hold timer...");
+          Serial.println(F("Upright – hold 5 s…"));
         } else if (millis() - uprightStartTime >= RECOVERY_TIME) {
-          robotState = NORMAL;
-          velocity_error_integral = 0;  // Reset integrator on recovery
-          motor_balance_compensation = 0;
-          Serial.println("*** ROBOT RECOVERED! Resuming balance control. ***");
+          robotState = RobotState::NORMAL;
+          vel_error_integral = balance_comp = 0.0f;
+          Serial.println(F("*** RECOVERED – balancing resumed ***"));
         }
       } else {
-        // Not upright — reset timer
         uprightStartTime = 0;
       }
       break;
 
-    case RECOVERY:
-      // Should not reach here — merged into FALLEN logic
+    case RobotState::RECOVERY:   // unused – kept for completeness
       break;
   }
 
-  // === Command handling (reduced frequency) ===
-  static unsigned long lastCommand = 0;
-  if (millis() - lastCommand > 100) {
+  /* ---------- COMMAND HANDLER (throttled) ---------- */
+  static unsigned long lastCmd = 0;
+  if (millis() - lastCmd > 100) {
     command.run();
-    lastCommand = millis();
+    lastCmd = millis();
   }
 
-  // === Debug output ===
+  /* ---------- DEBUG PRINT (500 ms) ---------- */
   static unsigned long lastPrint = 0;
   if (millis() - lastPrint > 500) {
-    Serial.print("Pitch: ");
-    Serial.print(pitch, 1);
-    Serial.print("° | State: ");
-    switch(robotState) {
-      case NORMAL:   Serial.print("NORMAL"); break;
-      case FALLEN:   Serial.print("FALLEN"); break;
-      case RECOVERY: Serial.print("RECOVERY"); break;
+    Serial.print(F("Pitch:")); Serial.print(pitch, 1);
+    Serial.print(F("° State:"));
+    switch (robotState) {
+      case RobotState::NORMAL:  Serial.print(F("NORMAL")); break;
+      case RobotState::FALLEN:  Serial.print(F("FALLEN")); break;
+      case RobotState::RECOVERY:Serial.print(F("RECOVERY"));break;
     }
-    if (robotState == FALLEN && uprightStartTime > 0) {
-      unsigned long elapsed = millis() - uprightStartTime;
-      Serial.print(" | Hold: ");
-      Serial.print(elapsed / 1000.0, 1);
-      Serial.print("s");
+    if (robotState == RobotState::FALLEN && uprightStartTime) {
+      Serial.print(F(" Hold:"));
+      Serial.print((millis() - uprightStartTime) / 1000.0, 1);
+      Serial.print('s');
     }
-    Serial.print(" | M1vel: ");
-    Serial.print(motor1_velocity, 2);
-    Serial.print(" | M2vel: ");
-    Serial.print(motor2_velocity, 2);
+    Serial.print(F(" V1:")); Serial.print(motor1_vel, 2);
+    Serial.print(F(" V2:")); Serial.print(motor2_vel, 2);
     Serial.println();
     lastPrint = millis();
   }
