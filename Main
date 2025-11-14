@@ -15,7 +15,7 @@
 /* -------------------- 1. CONSTANTS & TUNING -------------------- */
 constexpr uint8_t PCA9548A_ADDR = 0x70;
 
-constexpr float TARGET_PITCH      = -3.0f;   // Desired pitch (deg)
+constexpr float TARGET_PITCH      = -4.0f;   // Desired pitch (deg)
 constexpr float DEAD_ZONE         = 0.05f;  // Pitch error dead-zone
 constexpr float FALL_THRESHOLD    = 65.0f;  // deg → FALLEN
 constexpr float UPRIGHT_MIN       = -10.0f;
@@ -23,7 +23,7 @@ constexpr float UPRIGHT_MAX       =  10.0f;
 constexpr unsigned long RECOVERY_TIME = 5000; // ms
 
 // PID for balancing
-PIDController pid_balance{0.62f, 0.35f, 0.01f, 10000.0f, 20.0f};
+PIDController pid_balance{0.6f, 0.35f, 0.025f, 10000.0f, 20.0f};
 
 // Motor-balance compensation
 constexpr float BALANCE_KP               = 0.25f;
